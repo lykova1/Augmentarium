@@ -40,7 +40,22 @@ def plot_curves(train_losses, val_losses, train_accs, val_accs):
     plt.close()
 
 def main():
-    st.title("Аугментации: Manual (Albumentations) vs AutoAugment/RandAugment")
+
+    st.title("Augmentarium: Настройка аугментаций и обучение модели")
+
+    st.markdown("""
+    Добро пожаловать в **Augmentarium**! 
+    Здесь вы можете:
+    1. Загрузить датасет (он должен содержать папки `train/`, `val/`, `test/`).
+    2. Выбрать **ручные** аугментации (Albumentations) **или** автоматические (AutoAugment/RandAugment).
+    3. (Опционально) Включить «продвинутую» аугментацию (SamplePairing, GridMask, MixUp, CutMix, RICAP).
+    4. Посмотреть пример аугментированных изображений.
+    5. Запустить обучение и увидеть графики и финальную точность на тесте.
+
+    Просто настройте желаемые параметры, нажмите **"Показать пример"**, 
+    а затем **"Начать обучение"** — всё остальное приложение сделает автоматически.
+    """)
+
     dataset_root = st.text_input("Укажите путь к датасету (train/ val/ test):")
     if not dataset_root:
         st.warning("Сначала укажите путь к датасету.")
