@@ -1,5 +1,6 @@
-# models.py
 import random
+
+import numpy as np
 import torch
 import torchvision
 
@@ -36,6 +37,6 @@ def get_model(num_classes: int = 2) -> torch.nn.Module:
     """
     model = torchvision.models.resnet18(pretrained=True)
     for param in model.parameters():
-        param.requires_grad = False
+        param.require = False
     model.fc = torch.nn.Linear(512, num_classes)
     return model

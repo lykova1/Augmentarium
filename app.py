@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import os
 import random
@@ -7,12 +6,13 @@ import matplotlib.pyplot as plt
 import torch
 import logging
 
+import optuna  # Для оптимизации
+
 from augmentations import make_albumentations
 from datasets import build_dataset_and_loader
 from training import train_model, evaluate_on_test, mixup_data, cutmix_data, ricap_data
 from models import get_model
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
@@ -22,13 +22,9 @@ def to_one_hot(labels: torch.Tensor, num_classes: int = 2) -> torch.Tensor:
 
 
 def plot_curves(train_losses, val_losses, train_accs, val_accs) -> None:
-    """
-    Отображает графики потерь и точности по эпохам.
-    """
     ep = range(1, len(train_losses) + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # График Loss
     axes[0].plot(ep, train_losses, label='Train Loss', marker='o')
     axes[0].plot(ep, val_losses, label='Val Loss', marker='o')
     axes[0].set_title("Loss")
@@ -37,7 +33,6 @@ def plot_curves(train_losses, val_losses, train_accs, val_accs) -> None:
     axes[0].legend()
     axes[0].grid(True)
 
-    # График Accuracy
     axes[1].plot(ep, train_accs, label='Train Acc', marker='o')
     axes[1].plot(ep, val_accs, label='Val Acc', marker='o')
     axes[1].set_title("Accuracy")
@@ -59,10 +54,14 @@ def main():
     2. Выбрать **ручные** аугментации (Albumentations) **или** автоматические (AutoAugment/RandAugment).  
     3. (Опционально) Включить «продвинутую» аугментацию (SamplePairing, GridMask, MixUp, CutMix, RICAP).  
     4. Посмотреть пример аугментированных изображений.  
-    5. Запустить обучение и увидеть графики и финальную точность на тесте.  
-
-    Просто настройте параметры, нажмите **"Показать пример"**, а затем **"Начать обучение"**.
+    5. Запустить обучение и увидеть графики и финальную точность на тесте.
     """)
+
+    # Храним «best_params» и «best_acc» в session_state
+    if "best_params" not in st.session_state:
+        st.session_state["best_params"] = {}
+    if "best_acc" not in st.session_state:
+        st.session_state["best_acc"] = None
 
     dataset_root = st.text_input("Укажите путь к датасету (train/ val/ test):")
     if not dataset_root:
@@ -77,9 +76,20 @@ def main():
         st.error("Не найдены папки train/, val/, test/ в указанной директории.")
         return
 
-    # --- Выбор режима аугментаций ---
+    # --- Выбор режима ---
     st.subheader("Режим (Manual Albumentations / AutoAugment / RandAugment)")
     aug_mode = st.radio("Выберите режим:", ["None (Manual)", "AutoAugment", "RandAugment"])
+
+    # Параметры продвинутой аугментации (по умолчанию None)
+    st.session_state.setdefault("advanced_aug", "None")
+    st.session_state.setdefault("alpha_mixup", 0.2)
+    st.session_state.setdefault("alpha_cutmix", 0.2)
+    st.session_state.setdefault("alpha_ricap", 0.3)
+    st.session_state.setdefault("grid_dmin", 10)
+    st.session_state.setdefault("grid_dmax", 50)
+    st.session_state.setdefault("grid_r", 0.2)
+    st.session_state.setdefault("grid_p", 0.7)
+    st.session_state.setdefault("samplepairing_p", 0.5)
 
     advanced_aug = "None"
     gridmask_params = {}
@@ -90,19 +100,34 @@ def main():
     if aug_mode == "None (Manual)":
         st.subheader("Доп. аугментация (SamplePairing/ GridMask/ MixUp/ CutMix/ RICAP)")
         advanced_aug = st.radio("Одну на выбор:", ["None", "SamplePairing", "GridMask", "MixUp", "CutMix", "RICAP"])
+        st.session_state["advanced_aug"] = advanced_aug
+
         if advanced_aug == "GridMask":
-            st.markdown("**Параметры GridMask**:")
-            dmin = st.slider("d_min", 1, 50, 10)
-            dmax = st.slider("d_max", 10, 100, 50)
-            rr = st.slider("r (доля закрытия)", 0.0, 1.0, 0.2, 0.05)
-            pp = st.slider("p (вероятность)", 0.0, 1.0, 0.7, 0.05)
+            # Если в best_params что-то есть — берём оттуда
+            dmin_def = st.session_state["best_params"].get("gridmask_dmin", 10)
+            dmax_def = st.session_state["best_params"].get("gridmask_dmax", 50)
+            r_def = st.session_state["best_params"].get("gridmask_r", 0.2)
+            p_def = st.session_state["best_params"].get("gridmask_p", 0.7)
+
+            dmin = st.slider("d_min", 1, 50, dmin_def)
+            dmax = st.slider("d_max", 10, 100, dmax_def)
+            rr = st.slider("r (доля закрытия)", 0.0, 1.0, float(r_def), 0.05)
+            pp = st.slider("p (вероятность)", 0.0, 1.0, float(p_def), 0.05)
             gridmask_params = dict(d_min=dmin, d_max=dmax, r=rr, p=pp)
         elif advanced_aug == "MixUp":
-            alpha_mixup = st.slider("alpha MixUp", 0.0, 1.0, 0.2, 0.05)
+            alpha_mixup_def = st.session_state["best_params"].get("alpha_mixup", 0.2)
+            alpha_mixup = st.slider("alpha MixUp", 0.0, 1.0, float(alpha_mixup_def), 0.05)
         elif advanced_aug == "CutMix":
-            alpha_cutmix = st.slider("alpha CutMix", 0.0, 1.0, 0.2, 0.05)
+            alpha_cutmix_def = st.session_state["best_params"].get("alpha_cutmix", 0.2)
+            alpha_cutmix = st.slider("alpha CutMix", 0.0, 1.0, float(alpha_cutmix_def), 0.05)
         elif advanced_aug == "RICAP":
-            alpha_ricap = st.slider("alpha RICAP", 0.0, 1.0, 0.3, 0.05)
+            alpha_ricap_def = st.session_state["best_params"].get("alpha_ricap", 0.3)
+            alpha_ricap = st.slider("alpha RICAP", 0.0, 1.0, float(alpha_ricap_def), 0.05)
+        elif advanced_aug == "SamplePairing":
+            sp_def = st.session_state["best_params"].get("samplepairing_p", 0.5)
+            sp_val = st.slider("SamplePairing p", 0.0, 1.0, float(sp_def), 0.05)
+            st.session_state["samplepairing_p"] = sp_val
+
     else:
         st.info("Продвинутая аугментация отключена, т.к. выбран AutoAugment/RandAugment.")
         advanced_aug = "None"
@@ -111,56 +136,146 @@ def main():
     manual_transform = None
     tv_transform = None
 
+    # Ниже — блок «простых» аугментаций
+    if "use_flip" not in st.session_state:
+        # Инициализация чекбоксов и т.д.
+        st.session_state["use_flip"] = False
+        st.session_state["use_vflip"] = False
+        st.session_state["use_brightness"] = False
+        st.session_state["use_rotation"] = False
+        st.session_state["use_ssr"] = False
+        st.session_state["use_gaussnoise"] = False
+        st.session_state["use_gblur"] = False
+        st.session_state["use_mblur"] = False
+        st.session_state["use_sharpen"] = False
+        st.session_state["use_pixeldisp"] = False
+
     if aug_mode == "None (Manual)":
         st.subheader("Настройки базовых Albumentations:")
-        use_flip = st.checkbox("HorizontalFlip")
-        flip_prob = st.slider("Вероятность HorizontalFlip:", 0.0, 1.0, 0.5, 0.05) if use_flip else 0.5
 
-        vflip_flag = st.checkbox("VerticalFlip")
-        vflip_prob = st.slider("Вероятность VerticalFlip:", 0.0, 1.0, 0.5, 0.05) if vflip_flag else 0.5
+        # Чекбоксы
+        st.session_state["use_flip"] = st.checkbox("HorizontalFlip", value=st.session_state["use_flip"])
+        st.session_state["use_vflip"] = st.checkbox("VerticalFlip", value=st.session_state["use_vflip"])
+        st.session_state["use_brightness"] = st.checkbox("RandomBrightnessContrast", value=st.session_state["use_brightness"])
+        st.session_state["use_rotation"] = st.checkbox("RandomRotation", value=st.session_state["use_rotation"])
+        st.session_state["use_ssr"] = st.checkbox("ShiftScaleRotate", value=st.session_state["use_ssr"])
+        st.session_state["use_gaussnoise"] = st.checkbox("GaussNoise", value=st.session_state["use_gaussnoise"])
+        st.session_state["use_gblur"] = st.checkbox("GaussianBlur", value=st.session_state["use_gblur"])
+        st.session_state["use_mblur"] = st.checkbox("MotionBlur", value=st.session_state["use_mblur"])
+        st.session_state["use_sharpen"] = st.checkbox("Sharpen", value=st.session_state["use_sharpen"])
+        st.session_state["use_pixeldisp"] = st.checkbox("Random Pixel Displacement", value=st.session_state["use_pixeldisp"])
 
-        brightness_flag = st.checkbox("RandomBrightnessContrast")
-        brightness_limit = st.slider("brightness_limit:", 0.0, 1.0, 0.2, 0.05) if brightness_flag else 0.2
+        # Дефолт для слайдеров (если best_params ещё не заполнен)
+        bestp = st.session_state["best_params"]
 
-        rotation_flag = st.checkbox("RandomRotation")
-        max_rotation = st.slider("Макс угол поворота (градусы):", 0.0, 90.0, 30.0, 5.0) if rotation_flag else 30.0
+        flip_def = bestp.get("flip_prob", 0.5)
+        vflip_def = bestp.get("vflip_prob", 0.5)
+        bright_def = bestp.get("brightness_limit", 0.2)
+        rot_def = bestp.get("rotation_limit", 30.0)
+        shift_def = bestp.get("shift_limit", 0.0625)
+        scale_def = bestp.get("scale_limit", 0.1)
+        ssr_rot_def = bestp.get("rotate_limit", 45)
+        gauss_def = bestp.get("gauss_varlimit", 30)
+        gblur_def = bestp.get("gblur_limit", 3)
+        mblur_def = bestp.get("mblur_limit", 3)
+        sharpen_def = bestp.get("sharpen_alpha", 0.3)
+        pixel_def = bestp.get("pixel_disp_std", 0.7)
 
-        ssr_flag = st.checkbox("ShiftScaleRotate")
-        if ssr_flag:
-            shift_limit = st.slider("Shift limit:", 0.0, 0.3, 0.0625, 0.01)
-            scale_limit = st.slider("Scale limit:", 0.0, 0.5, 0.1, 0.01)
-            rotate_limit = st.slider("Rotate limit:", 0, 90, 45, 5)
-        else:
-            shift_limit, scale_limit, rotate_limit = 0.0625, 0.1, 45
+        # Слайдеры (только если аугментация включена)
+        flip_prob = flip_def
+        if st.session_state["use_flip"]:
+            flip_prob = st.slider("Вероятность HorizontalFlip:", 0.0, 1.0, float(flip_def), 0.05)
 
-        gauss_flag = st.checkbox("GaussNoise")
-        gauss_varlimit = st.slider("GaussNoise var_limit:", 1.0, 100.0, 30.0, 1.0) if gauss_flag else 30.0
+        vflip_prob = vflip_def
+        if st.session_state["use_vflip"]:
+            vflip_prob = st.slider("Вероятность VerticalFlip:", 0.0, 1.0, float(vflip_def), 0.05)
 
-        gblur_flag = st.checkbox("GaussianBlur")
-        gblur_limit = st.slider("GaussianBlur limit:", 3, 15, 3, 1) if gblur_flag else 3
+        brightness_limit = bright_def
+        if st.session_state["use_brightness"]:
+            brightness_limit = st.slider("brightness_limit:", 0.0, 1.0, float(bright_def), 0.05)
 
-        mblur_flag = st.checkbox("MotionBlur")
-        mblur_limit = st.slider("MotionBlur limit:", 3, 15, 3, 1) if mblur_flag else 3
+        max_rotation = rot_def
+        if st.session_state["use_rotation"]:
+            max_rotation = st.slider("Макс угол поворота (градусы):", 0.0, 90.0, float(rot_def), 5.0)
 
-        sharpen_flag = st.checkbox("Sharpen")
-        sharpen_alpha = st.slider("Sharpen alpha max:", 0.1, 1.0, 0.3, 0.1) if sharpen_flag else 0.3
+        shift_limit = shift_def
+        scale_limit = scale_def
+        rotate_limit = ssr_rot_def
+        if st.session_state["use_ssr"]:
+            shift_limit = st.slider("Shift limit:", 0.0, 0.3, float(shift_def), 0.01)
+            scale_limit = st.slider("Scale limit:", 0.0, 0.5, float(scale_def), 0.01)
+            rotate_limit = st.slider("Rotate limit:", 0, 90, int(ssr_rot_def), 5)
 
-        pixeldisp_flag = st.checkbox("Random Pixel Displacement")
-        pixel_disp_std = st.slider("stddev для PixelDisplacement:", 0.1, 5.0, 0.7, 0.1) if pixeldisp_flag else 0.7
+        gauss_varlimit = gauss_def
+        if st.session_state["use_gaussnoise"]:
+            gauss_varlimit = st.slider("GaussNoise var_limit:", 1.0, 100.0, float(gauss_def), 1.0)
 
+        gblur_limit = gblur_def
+        if st.session_state["use_gblur"]:
+            gblur_limit = st.slider("GaussianBlur limit:", 3, 15, int(gblur_def), 1)
+
+        mblur_limit = mblur_def
+        if st.session_state["use_mblur"]:
+            mblur_limit = st.slider("MotionBlur limit:", 3, 15, int(mblur_def), 1)
+
+        sharpen_alpha = sharpen_def
+        if st.session_state["use_sharpen"]:
+            sharpen_alpha = st.slider("Sharpen alpha max:", 0.1, 1.0, float(sharpen_def), 0.1)
+
+        pixel_disp_std = pixel_def
+        if st.session_state["use_pixeldisp"]:
+            pixel_disp_std = st.slider("stddev для PixelDisplacement:", 0.1, 5.0, float(pixel_def), 0.1)
+
+        # Формируем manual_transform
         manual_transform = make_albumentations(
-            use_flip=use_flip, flip_prob=flip_prob,
-            use_vflip=vflip_flag, vflip_prob=vflip_prob,
-            use_brightness=brightness_flag, brightness_limit=brightness_limit,
-            use_rotation=rotation_flag, max_rotation=max_rotation,
-            use_shift_scale_rot=ssr_flag, shift_limit=shift_limit, scale_limit=scale_limit, rotate_limit=rotate_limit,
-            use_gaussnoise=gauss_flag, gauss_varlimit=gauss_varlimit,
-            use_gaussianblur=gblur_flag, blur_limit=gblur_limit,
-            use_motionblur=mblur_flag, mblur_limit=mblur_limit,
-            use_sharpen=sharpen_flag, sharpen_alpha=sharpen_alpha,
-            use_pixeldisp=pixeldisp_flag, pixel_disp_std=pixel_disp_std
+            use_flip=st.session_state["use_flip"], flip_prob=flip_prob,
+            use_vflip=st.session_state["use_vflip"], vflip_prob=vflip_prob,
+            use_brightness=st.session_state["use_brightness"], brightness_limit=brightness_limit,
+            use_rotation=st.session_state["use_rotation"], max_rotation=max_rotation,
+            use_shift_scale_rot=st.session_state["use_ssr"],
+            shift_limit=shift_limit, scale_limit=scale_limit, rotate_limit=rotate_limit,
+            use_gaussnoise=st.session_state["use_gaussnoise"], gauss_varlimit=gauss_varlimit,
+            use_gaussianblur=st.session_state["use_gblur"], blur_limit=gblur_limit,
+            use_motionblur=st.session_state["use_mblur"], mblur_limit=mblur_limit,
+            use_sharpen=st.session_state["use_sharpen"], sharpen_alpha=sharpen_alpha,
+            use_pixeldisp=st.session_state["use_pixeldisp"], pixel_disp_std=pixel_disp_std
         )
         tv_transform = None
+
+        # --- Автоподбор
+        st.subheader("Автоматический подбор гиперпараметров (Optuna)")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("Оптимизировать гиперпараметры"):
+                with st.spinner("Оптимизация... может занять несколько минут"):
+                    best_params, best_acc = optimize_aug_params(
+                        train_dir, val_dir, test_dir,
+                        use_flip=st.session_state["use_flip"],
+                        use_vflip=st.session_state["use_vflip"],
+                        use_brightness=st.session_state["use_brightness"],
+                        use_rotation=st.session_state["use_rotation"],
+                        use_ssr=st.session_state["use_ssr"],
+                        use_gaussnoise=st.session_state["use_gaussnoise"],
+                        use_gblur=st.session_state["use_gblur"],
+                        use_mblur=st.session_state["use_mblur"],
+                        use_sharpen=st.session_state["use_sharpen"],
+                        use_pixeldisp=st.session_state["use_pixeldisp"],
+                        # Продвинутая аугментация
+                        advanced_aug=st.session_state["advanced_aug"]
+                    )
+                    # Сохраняем результат
+                    st.session_state["best_params"] = best_params
+                    st.session_state["best_acc"] = best_acc
+                st.success(f"Оптимизация завершена! val_acc={best_acc:.2f}%. Параметры: {best_params}")
+
+        with col2:
+            if st.button("Применить лучшие параметры"):
+                if st.session_state["best_params"]:
+                    st.success("Параметры применены! Слайдеры обновятся при следующем рендере.")
+                else:
+                    st.warning("Сначала запустите оптимизацию, чтобы получить лучшие параметры.")
 
     elif aug_mode == "AutoAugment":
         st.subheader("Параметры AutoAugment (torchvision)")
@@ -190,7 +305,7 @@ def main():
         ])
         manual_transform = None
 
-    # --- Показ примера аугментации ---
+    # --- Показ примера ---
     st.subheader("Показать пример аугментации")
     if st.button("Показать пример"):
         @st.cache_data(show_spinner=False)
@@ -200,8 +315,9 @@ def main():
                 manual_transform=manual_transform,
                 tv_transform=tv_transform,
                 batch_size=8,
-                advanced_aug=advanced_aug,
-                gridmask_params=gridmask_params if advanced_aug == "GridMask" else None
+                advanced_aug=st.session_state["advanced_aug"],
+                gridmask_params=gridmask_params if st.session_state["advanced_aug"] == "GridMask" else None,
+                samplepairing_p=st.session_state.get("samplepairing_p", 0.5)  # Для SamplePairing, если нужно
             )
         train_loader, _, _ = load_data()
 
@@ -209,15 +325,14 @@ def main():
         images, labels = next(data_iter)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         images, labels = images.to(device), labels.to(device)
-
         classes = ["Benign", "Malignant"]
 
-        if advanced_aug == "MixUp":
+        adv = st.session_state["advanced_aug"]
+        if adv == "MixUp":
             mix_inp, (la, lb), lam_m = mixup_data(images, to_one_hot(labels, 2).to(device), alpha_mixup, device=device)
             final_labels = lam_m * la + (1 - lam_m) * lb
             plt.figure(figsize=(15, 4))
-            B = mix_inp.size(0)
-            for i in range(min(5, B)):
+            for i in range(min(5, mix_inp.size(0))):
                 im = mix_inp[i].cpu().numpy().transpose(1, 2, 0)
                 im = (im * 0.5 + 0.5).clip(0, 1)
                 plt.subplot(1, 5, i + 1)
@@ -228,12 +343,11 @@ def main():
             st.pyplot(plt.gcf())
             plt.close()
 
-        elif advanced_aug == "CutMix":
+        elif adv == "CutMix":
             cm_inp, (la, lb), lam_c = cutmix_data(images, to_one_hot(labels, 2).to(device), alpha_cutmix, device=device)
             cm_labels = lam_c * la + (1 - lam_c) * lb
             plt.figure(figsize=(15, 4))
-            B = cm_inp.size(0)
-            for i in range(min(5, B)):
+            for i in range(min(5, cm_inp.size(0))):
                 im = cm_inp[i].cpu().numpy().transpose(1, 2, 0)
                 im = (im * 0.5 + 0.5).clip(0, 1)
                 plt.subplot(1, 5, i + 1)
@@ -244,11 +358,10 @@ def main():
             st.pyplot(plt.gcf())
             plt.close()
 
-        elif advanced_aug == "RICAP":
+        elif adv == "RICAP":
             ric_inp, ric_lbl, ric_w = ricap_data(images, labels, alpha_ricap, device=device)
             plt.figure(figsize=(15, 4))
-            B = ric_inp.size(0)
-            for i in range(min(5, B)):
+            for i in range(min(5, ric_inp.size(0))):
                 im = ric_inp[i].cpu().numpy().transpose(1, 2, 0)
                 im = (im * 0.5 + 0.5).clip(0, 1)
                 plt.subplot(1, 5, i + 1)
@@ -262,10 +375,11 @@ def main():
                 plt.axis("off")
             st.pyplot(plt.gcf())
             plt.close()
+
         else:
+            # SamplePairing / GridMask / None
             plt.figure(figsize=(15, 4))
-            B = images.size(0)
-            for i in range(min(5, B)):
+            for i in range(min(5, images.size(0))):
                 im = images[i].cpu().numpy().transpose(1, 2, 0)
                 im = (im * 0.5 + 0.5).clip(0, 1)
                 plt.subplot(1, 5, i + 1)
@@ -279,19 +393,23 @@ def main():
     st.subheader("Параметры обучения")
     epochs = st.slider("Epochs", 1, 30, 5)
     batch_size = st.slider("Batch size", 4, 128, 32)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     st.write("Используемое устройство:", device)
 
     if st.button("Начать обучение"):
         with st.spinner("Загрузка данных..."):
+
+            # Если user выбрал GridMask — параметры берем из переменной
+            # Если выбрал MixUp/CutMix/... — берем alpha из слайдера
+            # SamplePairing p — тоже учесть
             train_loader, val_loader, test_loader = build_dataset_and_loader(
                 train_dir, val_dir, test_dir,
                 manual_transform=manual_transform,
                 tv_transform=tv_transform,
                 batch_size=batch_size,
-                advanced_aug=advanced_aug,
-                gridmask_params=gridmask_params if advanced_aug == "GridMask" else None
+                advanced_aug=st.session_state["advanced_aug"],
+                gridmask_params=gridmask_params if st.session_state["advanced_aug"] == "GridMask" else None,
+                samplepairing_p=st.session_state.get("samplepairing_p", 0.5)
             )
 
         progress_bar = st.progress(0)
@@ -301,9 +419,10 @@ def main():
             progress_bar.progress((epoch + 1) / total_epochs)
             status_text.text(f"Эпоха {epoch + 1} из {total_epochs}")
 
-        model, stats = train_model(
+        # Передаём alpha_* в train_model (если выбрана MixUp/CutMix/RICAP)
+        final_model, stats = train_model(
             train_loader, val_loader, device=device, epochs=epochs,
-            advanced_aug=advanced_aug,
+            advanced_aug=st.session_state["advanced_aug"],
             alpha_mixup=alpha_mixup,
             alpha_cutmix=alpha_cutmix,
             alpha_ricap=alpha_ricap,
@@ -315,10 +434,119 @@ def main():
         plot_curves(train_losses, val_losses, train_accs, val_accs)
 
         st.subheader("Точность на тесте")
-        test_acc = evaluate_on_test(model, test_loader, device)
+        test_acc = evaluate_on_test(final_model, test_loader, device)
         st.write(f"Test Accuracy = {test_acc:.2f}%")
-
         st.success("Обучение завершено!")
+
+
+# ---------------------------------------------------
+# Оптимизация Optuna
+# ---------------------------------------------------
+def optimize_aug_params(
+    train_dir, val_dir, test_dir,
+    advanced_aug="None",
+    use_flip=False,
+    use_vflip=False,
+    use_brightness=False,
+    use_rotation=False,
+    use_ssr=False,
+    use_gaussnoise=False,
+    use_gblur=False,
+    use_mblur=False,
+    use_sharpen=False,
+    use_pixeldisp=False,
+    n_trials=5
+):
+    """
+    Подбираем гиперпараметры только для выбранных аугментаций:
+      - flip_prob, vflip_prob, brightness_limit, ...
+      - Параметры для ShiftScaleRotate ...
+      - Параметры для продвинутой аугментации (MixUp, CutMix, RICAP, GridMask, SamplePairing)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def objective(trial: optuna.trial.Trial):
+        # 1) Простые аугментации
+        flip_prob = trial.suggest_float("flip_prob", 0.1, 0.9) if use_flip else 0.5
+        vflip_prob = trial.suggest_float("vflip_prob", 0.1, 0.9) if use_vflip else 0.5
+        brightness_limit = trial.suggest_float("brightness_limit", 0.1, 0.6) if use_brightness else 0.2
+        rotation_limit = trial.suggest_int("rotation_limit", 0, 90) if use_rotation else 30
+        shift_limit = trial.suggest_float("shift_limit", 0.0, 0.3) if use_ssr else 0.0625
+        scale_limit = trial.suggest_float("scale_limit", 0.0, 0.5) if use_ssr else 0.1
+        rotate_limit = trial.suggest_int("rotate_limit", 0, 90) if use_ssr else 45
+        gauss_varlimit = trial.suggest_int("gauss_varlimit", 10, 100) if use_gaussnoise else 30
+        gblur_limit = trial.suggest_int("gblur_limit", 3, 15) if use_gblur else 3
+        mblur_limit = trial.suggest_int("mblur_limit", 3, 15) if use_mblur else 3
+        sharpen_alpha = trial.suggest_float("sharpen_alpha", 0.1, 1.0) if use_sharpen else 0.3
+        pixel_disp_std = trial.suggest_float("pixel_disp_std", 0.1, 5.0) if use_pixeldisp else 0.7
+
+        # 2) Продвинутая аугментация
+        # Если пользователь не выбрал продвинутую аугментацию, не подбираем её параметры.
+        alpha_mixup, alpha_cutmix, alpha_ricap = 0.2, 0.2, 0.3
+        gridmask_dmin, gridmask_dmax, gridmask_r, gridmask_p = 10, 50, 0.2, 0.7
+        samplepairing_p = 0.5
+
+        if advanced_aug == "MixUp":
+            alpha_mixup = trial.suggest_float("alpha_mixup", 0.0, 1.0)
+        elif advanced_aug == "CutMix":
+            alpha_cutmix = trial.suggest_float("alpha_cutmix", 0.0, 1.0)
+        elif advanced_aug == "RICAP":
+            alpha_ricap = trial.suggest_float("alpha_ricap", 0.0, 1.0)
+        elif advanced_aug == "GridMask":
+            gridmask_dmin = trial.suggest_int("gridmask_dmin", 1, 50)
+            gridmask_dmax = trial.suggest_int("gridmask_dmax", 10, 100)
+            gridmask_r = trial.suggest_float("gridmask_r", 0.0, 1.0)
+            gridmask_p = trial.suggest_float("gridmask_p", 0.0, 1.0)
+        elif advanced_aug == "SamplePairing":
+            samplepairing_p = trial.suggest_float("samplepairing_p", 0.0, 1.0)
+
+        # 3) Собираем transform для простых аугментаций
+        transform = make_albumentations(
+            use_flip=use_flip, flip_prob=flip_prob,
+            use_vflip=use_vflip, vflip_prob=vflip_prob,
+            use_brightness=use_brightness, brightness_limit=brightness_limit,
+            use_rotation=use_rotation, max_rotation=rotation_limit,
+            use_shift_scale_rot=use_ssr,
+            shift_limit=shift_limit, scale_limit=scale_limit, rotate_limit=rotate_limit,
+            use_gaussnoise=use_gaussnoise, gauss_varlimit=gauss_varlimit,
+            use_gaussianblur=use_gblur, blur_limit=gblur_limit,
+            use_motionblur=use_mblur, mblur_limit=mblur_limit,
+            use_sharpen=use_sharpen, sharpen_alpha=sharpen_alpha,
+            use_pixeldisp=use_pixeldisp, pixel_disp_std=pixel_disp_std
+        )
+
+        # 4) build_dataset_and_loader с учетом продвинутой аугментации
+        #    (GridMask -> gridmask_params, SamplePairing -> samplepairing_p)
+        if advanced_aug == "GridMask":
+            gmask_params = dict(d_min=gridmask_dmin, d_max=gridmask_dmax, r=gridmask_r, p=gridmask_p)
+        else:
+            gmask_params = None
+
+        train_loader, val_loader, _ = build_dataset_and_loader(
+            train_dir, val_dir, test_dir,
+            manual_transform=transform,
+            tv_transform=None,
+            batch_size=16,
+            advanced_aug=advanced_aug,
+            gridmask_params=gmask_params,
+            samplepairing_p=samplepairing_p
+        )
+
+        # 5) train_model с учетом MixUp / CutMix / RICAP
+        model, stats = train_model(
+            train_loader, val_loader, device=device, epochs=3,
+            advanced_aug=advanced_aug,
+            alpha_mixup=alpha_mixup,
+            alpha_cutmix=alpha_cutmix,
+            alpha_ricap=alpha_ricap
+        )
+        val_acc = stats[3][-1]
+        return val_acc
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+
+    return study.best_params, study.best_value
 
 
 if __name__ == "__main__":
