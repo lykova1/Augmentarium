@@ -8,6 +8,10 @@ from torch.utils.data import DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+# 1) Импортируем нужное для коллатора
+from torch.utils.data.dataloader import default_collate
+from models import GridMask  # понадобится в коллаторе
+
 
 class AlbDataset(torch.utils.data.Dataset):
     """
@@ -83,6 +87,24 @@ class TorchVisionDataset(torchvision.datasets.ImageFolder):
         return img, label
 
 
+# 2) Глобальный класс-коллатор для GridMask
+class GridMaskTransformCollator:
+    """
+    Класс, оборачивающий применение GridMask к батчу данных.
+    """
+    def __init__(self, gridmask_params):
+        self.gridmask_transform = GridMask(**gridmask_params)
+
+    def __call__(self, batch):
+        new_batch = []
+        for (img_t, lbl) in batch:
+            # Применяем GridMask к каждому изображению
+            transformed_img = self.gridmask_transform(img_t)
+            new_batch.append((transformed_img, lbl))
+        # Стандартная функция склеивания батча
+        return default_collate(new_batch)
+
+
 def build_dataset_and_loader(
     train_dir: str, val_dir: str, test_dir: str,
     manual_transform=None, tv_transform=None,
@@ -94,8 +116,6 @@ def build_dataset_and_loader(
     """
     Собирает DataLoader для train, val и test наборов.
     """
-    from models import GridMask
-
     if tv_transform is not None:
         # Для AutoAugment / RandAugment
         if advanced_aug == "SamplePairing":
@@ -111,22 +131,14 @@ def build_dataset_and_loader(
         else:
             train_dataset = AlbDataset(train_dir, transform=manual_transform)
 
+    # Если GridMask включён, используем специальный коллатор
     if advanced_aug == "GridMask" and tv_transform is None and gridmask_params is not None:
-        class GridMaskTransform:
-            def __init__(self, params):
-                self.gm = GridMask(**params)
-            def __call__(self, img_t):
-                return self.gm(img_t)
-        def collate_fn(batch):
-            gm = GridMaskTransform(gridmask_params)
-            new_batch = []
-            for (img_t, lbl) in batch:
-                new_batch.append((gm(img_t), lbl))
-            return torch.utils.data.dataloader.default_collate(new_batch)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        collator = GridMaskTransformCollator(gridmask_params)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collator)
     else:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
+    # Валидация и тест без GridMask
     val_tf = A.Compose([
         A.Resize(64, 64),
         A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
@@ -135,7 +147,7 @@ def build_dataset_and_loader(
     val_dataset = AlbDataset(val_dir, transform=val_tf)
     test_dataset = AlbDataset(test_dir, transform=val_tf)
 
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    val_loader  = DataLoader(val_dataset,  batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, test_loader

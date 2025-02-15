@@ -1,5 +1,4 @@
 import random
-
 import numpy as np
 import torch
 import torchvision
@@ -9,6 +8,7 @@ class GridMask:
     """
     Реализация GridMask для применения маски к изображению.
     """
+
     def __init__(self, d_min: int = 10, d_max: int = 50, r: float = 0.2, p: float = 0.7):
         self.d_min = d_min
         self.d_max = d_max
@@ -18,9 +18,14 @@ class GridMask:
     def __call__(self, img_tensor: torch.Tensor) -> torch.Tensor:
         if random.random() > self.p:
             return img_tensor
-        _, H, W = img_tensor.shape
-        d = random.randint(self.d_min, self.d_max)
+
+        # Гарантируем, что нижняя граница не больше верхней
+        d_min = min(self.d_min, self.d_max)
+        d_max = max(self.d_min, self.d_max)
+        d = random.randint(d_min, d_max)
         l = int(d * self.r)
+
+        _, H, W = img_tensor.shape
         mask = np.ones((H, W), dtype=np.float32)
         for i in range(0, H, d):
             for j in range(0, W, d):
